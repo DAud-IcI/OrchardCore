@@ -100,9 +100,8 @@ namespace OrchardCore.Modules
             }
         }
 
-        private async Task RunAsync(IEnumerable<(string Tenant, long UtcTicks)> runningShells, CancellationToken stoppingToken)
-        {
-            await Parallel.ForEachAsync(GetShellsToRun(runningShells), async (tenant, cancellationToken) =>
+        private Task RunAsync(IEnumerable<(string Tenant, long UtcTicks)> runningShells, CancellationToken stoppingToken) =>
+            Parallel.ForEachAsync(GetShellsToRun(runningShells), stoppingToken, async (tenant, cancellationToken) =>
             {
                 // Check if the shell is still registered and running.
                 if (!_shellHost.TryGetShellContext(tenant, out var shell) || !shell.Settings.IsRunning())
@@ -116,7 +115,7 @@ namespace OrchardCore.Modules
                 var schedulers = GetSchedulersToRun(tenant);
                 foreach (var scheduler in schedulers)
                 {
-                    if (stoppingToken.IsCancellationRequested)
+                    if (cancellationToken.IsCancellationRequested)
                     {
                         break;
                     }
@@ -135,13 +134,12 @@ namespace OrchardCore.Modules
                         break;
                     }
 
-                    var locked = false;
-                    ILocker locker = null;
+                    ILocker locker;
                     try
                     {
                         // Try to acquire a lock before using the scope, so that a next process gets the last committed data.
                         var distributedLock = shellScope.ShellContext.ServiceProvider.GetRequiredService<IDistributedLock>();
-                        (locker, locked) = await distributedLock.TryAcquireBackgroundTaskLockAsync(scheduler.Settings);
+                        (locker, var locked) = await distributedLock.TryAcquireBackgroundTaskLockAsync(scheduler.Settings);
                         if (!locked)
                         {
                             await shellScope.TerminateShellAsync();
@@ -204,14 +202,14 @@ namespace OrchardCore.Modules
                         var context = new BackgroundTaskEventContext(taskName, scope);
                         var handlers = scope.ServiceProvider.GetServices<IBackgroundTaskEventHandler>();
 
-                        await handlers.InvokeAsync((handler, context, token) => handler.ExecutingAsync(context, token), context, stoppingToken, _logger);
+                        await handlers.InvokeAsync((handler, context, token) => handler.ExecutingAsync(context, token), context, cancellationToken, _logger);
 
                         try
                         {
                             _logger.LogInformation("Start processing background task '{TaskName}' on tenant '{TenantName}'.", taskName, tenant);
 
                             scheduler.Run();
-                            await task.DoWorkAsync(scope.ServiceProvider, stoppingToken);
+                            await task.DoWorkAsync(scope.ServiceProvider, cancellationToken);
 
                             _logger.LogInformation("Finished processing background task '{TaskName}' on tenant '{TenantName}'.", taskName, tenant);
                         }
@@ -223,14 +221,13 @@ namespace OrchardCore.Modules
                             await scope.HandleExceptionAsync(ex);
                         }
 
-                        await handlers.InvokeAsync((handler, context, token) => handler.ExecutedAsync(context, token), context, stoppingToken, _logger);
+                        await handlers.InvokeAsync((handler, context, token) => handler.ExecutedAsync(context, token), context, cancellationToken, _logger);
                     });
                 }
 
                 // Clear the 'HttpContext' for this async flow.
                 _httpContextAccessor.HttpContext = null;
             });
-        }
 
         private async Task UpdateAsync(
             (string Tenant, long UtcTicks)[] previousShells,
@@ -238,9 +235,9 @@ namespace OrchardCore.Modules
         {
             var referenceTime = DateTime.UtcNow;
 
-            await Parallel.ForEachAsync(GetShellsToUpdate(previousShells, runningShells), async (tenant, cancellationToken) =>
+            await Parallel.ForEachAsync(GetShellsToUpdate(previousShells, runningShells), stoppingToken, async (tenant, cancellationToken) =>
             {
-                if (stoppingToken.IsCancellationRequested)
+                if (cancellationToken.IsCancellationRequested)
                 {
                     return;
                 }
